@@ -108,7 +108,23 @@ Sorry about the inconvenience." :red))
     (apply primrose/first
       (map #(future (sh/exit-code %)) procs))))
 
-(defn  ^:no-project-needed cooper
+(defn- wait-for-exit [proc]
+  (let [exit-code (sh/exit-code proc)]
+    (if (zero? exit-code)
+      (synchronized-println (style (str "Process '" (:name proc) "' exitted successfully") :blue))
+      (synchronized-println (style (str "Process '" (:name proc) "' exitted with exit code " exit-code) :red)))))
+
+(defn- wait-for-all-to-exit
+  "Blocks until all of the running processes produce an exit code"
+  [procs]
+  (deref
+    (apply primrose/all (map #(future (wait-for-exit %)) procs))))
+
+(defn- use-bash-wrapper? []
+  (let [os-name (System/getProperty "os.name")]
+    (= os-name "Mac OS X")))
+
+(defn ^:no-project-needed cooper-spawn
   "Combine multiple long runnning processes and pipe their output and error
    streams to `stdout` in a distinctive manner.
 
@@ -151,7 +167,38 @@ Sorry about the inconvenience." :red))
     (when (= 0 (count procs))
       (println (style (str "No valid cooper processes found.") :red))
       (abort))
-    (doto (-> procs calculate-padding)
-      (pipe-procs)
-      (wait-for-early-exit)
-      (fail))))
+    (if (use-bash-wrapper?)
+      (doto (-> procs calculate-padding)
+        (pipe-procs)
+        (wait-for-all-to-exit))
+      (doto (-> procs calculate-padding)
+        (pipe-procs)
+        (wait-for-early-exit)
+        (fail)))))
+
+(defn- get-bash-wrapper-resource []
+  {:post [%]}
+  (io/resource "bash-wrapper.sh"))
+
+(defn- launch-printer! [stream & codes]
+  (future
+    (let [output (io/reader stream)]
+      (loop [out (.readLine output)]
+        (when-not (nil? out)
+          (synchronized-println (apply style out codes)))
+        (recur (.readLine output))))))
+
+(defn- spawn-bash-wrapper! []
+  (let [bash-wrapper-source (slurp (get-bash-wrapper-resource))
+        wrapper-proc (apply sh/proc "/usr/bin/env" "bash" "-c" bash-wrapper-source "--" *command-line-args*)
+        _err-printer (launch-printer! (:err wrapper-proc) :red)
+        _out-printer (launch-printer! (:out wrapper-proc))
+        exit-code (sh/exit-code wrapper-proc)]
+    (if-not (zero? exit-code)
+      (synchronized-println (style (str "Wrapper exitted with exit code " exit-code) :red)))))
+
+(defn ^:no-project-needed cooper [project & args]
+  (let [cooper-spawn? (= (System/getenv "COOPER_SPAWN") "1")]
+    (if (and (use-bash-wrapper?) (not cooper-spawn?))
+      (spawn-bash-wrapper!)
+      (apply cooper-spawn project args))))
